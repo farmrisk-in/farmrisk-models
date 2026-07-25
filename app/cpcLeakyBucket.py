@@ -265,22 +265,41 @@ def penman_monteith_eto(tmax, tmin, dates, lat_deg, elev_m, pm=PM):
 # ----------------------------------------------------------------------
 # crop -> (L_ini, L_dev, L_mid, L_late, Kc_ini, Kc_mid, Kc_end, h_m)
 CROP_TABLE = {
-    "wheat":     (30,  140, 40,  30,  0.30, 1.15, 0.30, 1.0),   # winter wheat
-    "wheat_spring": (20, 25, 60, 30, 0.30, 1.15, 0.30, 1.0),
-    "rice":      (30,  30,  60,  30,  1.05, 1.20, 0.75, 1.0),   # paddy
-    "maize":     (30,  40,  50,  30,  0.30, 1.20, 0.60, 2.0),   # grain maize
-    "maize_sweet": (20, 25, 25, 10, 0.30, 1.15, 1.05, 1.5),
-    "sorghum":   (20,  35,  40,  30,  0.30, 1.10, 0.55, 1.5),
-    "millet":    (15,  25,  40,  25,  0.30, 1.00, 0.30, 1.5),
-    "cotton":    (30,  50,  60,  55,  0.35, 1.18, 0.60, 1.35),
-    "sugarcane": (35,  60,  190, 120, 0.40, 1.25, 0.75, 3.0),
-    "groundnut": (25,  35,  45,  25,  0.40, 1.15, 0.60, 0.4),
-    "soybean":   (20,  30,  60,  25,  0.40, 1.15, 0.50, 0.5),
-    "chickpea":  (20,  30,  35,  25,  0.40, 1.00, 0.35, 0.4),
-    "mustard":   (20,  35,  45,  25,  0.35, 1.10, 0.35, 0.6),   # rapeseed/canola
-    "potato":    (25,  30,  45,  30,  0.50, 1.15, 0.75, 0.6),
-    "tomato":    (30,  40,  40,  25,  0.60, 1.15, 0.80, 0.6),
-    "grass":     (10,  20,  60,  30,  0.30, 1.00, 0.85, 0.5),   # generic pasture
+    # --- Cereals (Table 12 group i: Kc_ini 0.30, Kc_mid 1.15, Kc_end 0.25-0.4) ---
+    "rice":          (30,  30,  60,  30,  1.05, 1.20, 0.75, 1.0),  # paddy; T12 rice
+    "wheat":         (15,  25,  50,  30,  0.30, 1.15, 0.30, 1.0),  # T11 Central India
+    "kharifsorghum": (20,  35,  40,  30,  0.30, 1.10, 0.55, 1.5),  # sorghum grain; kharif
+    "rabisorghum":   (20,  35,  45,  30,  0.30, 1.10, 0.55, 1.5),  # sorghum grain; rabi
+    "sorghum":       (20,  35,  40,  30,  0.30, 1.10, 0.55, 1.5),  # T11 May/Jun; T12 grain
+    "pearlmillet":   (15,  25,  40,  25,  0.30, 1.00, 0.30, 1.5),  # T11 millet Pakistan
+    "maize":         (20,  35,  40,  30,  0.30, 1.20, 0.60, 2.0),  # T11 India (grain)
+    "fingermillet":  (15,  25,  40,  25,  0.30, 1.00, 0.30, 1.0),  # ragi; millet proxy
+    "barley":        (15,  25,  50,  30,  0.30, 1.15, 0.25, 1.0),  # T12 barley
+    # --- Legumes / pulses (Table 12 group e: Kc_ini 0.40, Kc_mid 1.15, Kc_end 0.35) ---
+    "chickpea":      (20,  30,  40,  20,  0.40, 1.00, 0.35, 0.4),  # T12 chick pea
+    "pigeonpea":     (20,  30,  40,  30,  0.40, 1.15, 0.35, 1.0),  # arhar/tur; pulse proxy
+    "minorpulses":   (20,  30,  30,  20,  0.40, 1.05, 0.35, 0.4),  # ~green gram/cowpea (approx)
+    # --- Oil crops (Table 12 group h: Kc_ini 0.35, Kc_mid 1.15, Kc_end 0.35) ---
+    "groundnut":     (25,  35,  45,  25,  0.40, 1.15, 0.60, 0.4),  # T11 dry W Africa; T12 peanut
+    "sesamum":       (20,  30,  40,  20,  0.35, 1.10, 0.25, 1.0),  # T11/T12 sesame
+    "rapeseedandmustard": (20, 35, 45, 25, 0.35, 1.10, 0.35, 0.6), # T12 rapeseed/canola
+    "safflower":     (20,  35,  45,  25,  0.35, 1.10, 0.25, 0.8),  # T11/T12 safflower
+    "castor":        (25,  40,  65,  50,  0.35, 1.15, 0.55, 0.3),  # T11/T12 castorbean
+    "linseed":       (25,  35,  50,  40,  0.35, 1.10, 0.25, 1.2),  # T11/T12 flax
+    "sunflower":     (25,  35,  45,  25,  0.35, 1.10, 0.35, 2.0),  # T11/T12 sunflower
+    "soyabean":      (20,  25,  75,  30,  0.40, 1.15, 0.50, 0.75), # T11 Japan; T12 soybean
+    "oilseeds":      (25,  35,  45,  25,  0.35, 1.10, 0.35, 0.8),  # aggregate ~ oil crops (approx)
+    # --- Fibre / sugar / roots / veg ---
+    "sugarcane":     (35,  60,  190, 120, 0.40, 1.25, 0.75, 3.0),  # T11/T12 virgin cane
+    "cotton":        (30,  50,  60,  55,  0.35, 1.18, 0.60, 1.35), # T11/T12 cotton
+    "potatoes":      (25,  30,  45,  30,  0.50, 1.15, 0.75, 0.6),  # T12 potato
+    "onion":         (15,  25,  70,  40,  0.70, 1.05, 0.75, 0.4),  # T11/T12 onion (dry)
+    # --- Aggregate horticulture (approximate representatives) ---
+    "fruits":        (20,  70,  120, 60,  0.50, 0.95, 0.70, 4.0),  # ~deciduous orchard (approx)
+    "vegetables":    (25,  35,  40,  20,  0.60, 1.05, 0.90, 0.5),  # ~small vegetables (approx)
+    "fruitsandvegetables": (25, 40, 60, 30, 0.55, 1.00, 0.80, 1.0),# mixed hort. (approx)
+    # --- Forage ---
+    "fodder":        (10,  20,  60,  30,  0.30, 0.85, 0.85, 0.5),  # ~grazing pasture (approx)
 }
 KC_OFF = 0.20   # off-season / bare-soil-fallow Kc
 
