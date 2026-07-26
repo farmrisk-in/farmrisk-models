@@ -167,7 +167,8 @@ def get_health():
             "PYTHON_VERSION": sys.version,
             "CWD": os.getcwd()
         },
-        "data_files_health": health_status
+        "data_files_health": health_status,
+        "data_version": version_data
     }
 
 

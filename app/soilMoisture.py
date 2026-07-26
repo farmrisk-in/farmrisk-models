@@ -56,7 +56,7 @@ IMD_PARQUET = {
 # 'lon lat elev' grid file for FAO-56 Penman-Monteith (pressure / gamma).
 ELEV_FILE = f"{ROOT}data/grid_elevation.parquet"
 
-# District-level crop sowing/harvest calendar (for --plant-day default).
+# District-level crop sowing/harvest calendar (for --plant-doy default).
 CROP_CALENDAR_FILE = f"{ROOT}data/crop_calendar_parsed.csv"
 
 # Map model crop keys (cpc.CROP_TABLE) to keyword(s) matched (case-
@@ -151,7 +151,7 @@ def _window_mid_doy(rows):
     return int(round(np.mean(mids)))
 
 
-def default_plant_day(crop, district=None, calendar_path=CROP_CALENDAR_FILE):
+def default_plant_doy(crop, district=None, calendar_path=CROP_CALENDAR_FILE):
     """
     Approximate planting DOY for `crop` from the district crop calendar.
     Priority: district -> state (of that district) -> national, using the
@@ -160,11 +160,22 @@ def default_plant_day(crop, district=None, calendar_path=CROP_CALENDAR_FILE):
     if not os.path.exists(calendar_path):
         return None, f"calendar not found: {calendar_path}"
     cal = pd.read_csv(calendar_path)
-    keywords = CROP_CALENDAR_KEYWORDS.get(crop, [crop])
+    spec = CROP_CALENDAR_KEYWORDS.get(crop, [crop])
+    # A spec is a list of include keywords, optionally with a trailing dict
+    # {"exclude": [...]} to drop false matches (e.g. chickpea "gram" must
+    # not match "green gram" / "black gram", which are different pulses).
+    exclude = []
+    if spec and isinstance(spec[-1], dict):
+        exclude = spec[-1].get("exclude", [])
+        keywords = spec[:-1]
+    else:
+        keywords = spec
     cl = cal["Crop"].fillna("").str.lower()
     crop_mask = pd.Series(False, index=cal.index)
     for kw in keywords:
         crop_mask |= cl.str.contains(kw, regex=False)
+    for kw in exclude:
+        crop_mask &= ~cl.str.contains(kw, regex=False)
     sub = cal[crop_mask]
     if sub.empty:
         return None, f"no '{crop}' rows in calendar"
@@ -357,37 +368,26 @@ def build_forcing(lat, lon, pergrid_path):
 
 
 # ----------------------------------------------------------------------
-# Day-of-year climatological percentile of storage w
+# Overall percentile of storage w (whole record, all seasons pooled)
 # ----------------------------------------------------------------------
-def doy_percentile(w, window=15):
+def overall_percentile(w):
     """
-    For each day, percentile of w within a +/- `window`-day day-of-year
-    climatology pooled across all years (CPC-style). Returns 0-100 Series.
+    For each day, percentile of w against the ENTIRE record (every daily
+    value, all seasons pooled) rather than a day-of-year climatology.
+
+    percentile(t) = 100 * (#days with w <= w(t)) / N   over all days N.
+
+    NOTE: because the seasonal cycle is pooled in, in a monsoon climate a
+    high percentile largely reflects being in a wet season rather than an
+    anomaly relative to that time of year. Returns a 0-100 Series aligned
+    to the (non-NaN) index of `w`.
     """
     s = w.dropna()
-    doy = s.index.dayofyear.values
     vals = s.values
-    n = len(s)
-    pct = np.full(n, np.nan)
-
-    # Pre-bin values by day-of-year for speed.
-    by_doy = {}
-    for d in range(1, 367):
-        lo, hi = d - window, d + window
-        sel = ((doy >= lo) & (doy <= hi))
-        # wrap-around at year boundary
-        if lo < 1:
-            sel |= (doy >= 366 + lo)
-        if hi > 366:
-            sel |= (doy <= hi - 366)
-        by_doy[d] = np.sort(vals[sel])
-
-    for i in range(n):
-        ref = by_doy[doy[i]]
-        # percentile = fraction of climatology <= this value
-        rank = np.searchsorted(ref, vals[i], side="right")
-        pct[i] = 100.0 * rank / len(ref)
-
+    ref = np.sort(vals)                       # single pooled reference
+    # fraction of the record <= each value (right side -> ties count in)
+    rank = np.searchsorted(ref, vals, side="right")
+    pct = 100.0 * rank / len(ref)
     return pd.Series(pct, index=s.index)
 
 
@@ -395,7 +395,7 @@ def doy_percentile(w, window=15):
 # Per-village processing
 # ----------------------------------------------------------------------
 def run_point(pergrid_path, taluka, village, out_tag, lat, lon, calib,
-              elev_table=None, crop=None, plant_day=1, daysbefore=None, 
+              elev_table=None, crop=None, plant_doy=1, daysbefore=None, 
               out_dir=OUT_DIR, save_csv=False):
     """Core pipeline for one point; out_tag names the output file sm_<tag>.csv."""
     forcing = build_forcing(lat, lon, pergrid_path)
@@ -423,7 +423,7 @@ def run_point(pergrid_path, taluka, village, out_tag, lat, lon, calib,
     if crop is not None:
         kc = cpc.build_kc_series(
             forcing.index, forcing["tmax"], forcing["tmin"],
-            crop=crop, plant_day=plant_day, u2=cpc.PM["u2"],
+            crop=crop, plant_doy=plant_doy, u2=cpc.PM["u2"],
         )
         pe = pe * kc
 
@@ -437,7 +437,7 @@ def run_point(pergrid_path, taluka, village, out_tag, lat, lon, calib,
 
     # attach is_forecast (model drops 1 spin-up year)
     res = res.join(forcing[["is_forecast"]], how="left")
-    res["sm_percentile"] = doy_percentile(res["w"])
+    res["sm_percentile"] = overall_percentile(res["w"])
 
     res.insert(0, "village", village)
     res.insert(1, "taluka", taluka)
@@ -461,7 +461,7 @@ def run_point(pergrid_path, taluka, village, out_tag, lat, lon, calib,
 
 
 def process_village(vid, taluka, village, lat, lon, calib,
-                    elev_table=None, crop=None, plant_day=1, daysbefore=None,
+                    elev_table=None, crop=None, plant_doy=1, daysbefore=None,
                     pergrid_dir=None, out_dir=OUT_DIR, save_csv=False):
     pergrid_path = find_pergrid(vid, village, pergrid_dir=pergrid_dir)
     if pergrid_path is None:
@@ -471,7 +471,7 @@ def process_village(vid, taluka, village, lat, lon, calib,
         
     return run_point(pergrid_path, taluka, village, f"{vid}_{village}",
                      lat, lon, calib, elev_table=elev_table,
-                     crop=crop, plant_day=plant_day, daysbefore=daysbefore,
+                     crop=crop, plant_doy=plant_doy, daysbefore=daysbefore,
                      out_dir=out_dir, save_csv=save_csv)
 
 
@@ -500,7 +500,7 @@ def run_soil_moisture_pipeline(
     lat=None,
     lon=None,
     crop=None,
-    plant_day=None,
+    plant_doy=None,
     district=None,
     daysbefore=None,
     calib_file=CALIB_FILE,
@@ -520,15 +520,15 @@ def run_soil_moisture_pipeline(
     if villages_file is None:
         villages_file = globals().get("VILLAGES_FILE", f"{ROOT}Pilot_80_Villages")
 
-    # Resolve planting DOY when a crop is requested but plant_day omitted.
-    if crop is not None and plant_day is None:
-        day_val, _ = default_plant_day(crop, district=district, calendar_path=crop_calendar_file)
+    # Resolve planting DOY when a crop is requested but plant_doy omitted.
+    if crop is not None and plant_doy is None:
+        day_val, _ = default_plant_doy(crop, district=district, calendar_path=crop_calendar_file)
         if day_val is not None:
-            plant_day = day_val
+            plant_doy = day_val
         else:
-            plant_day = 1
-    elif plant_day is None:
-        plant_day = 1   # no crop -> value is unused anyway
+            plant_doy = 1
+    elif plant_doy is None:
+        plant_doy = 1   # no crop -> value is unused anyway
 
     calib = pd.read_csv(calib_file)
     calib = calib[calib["status"] == "ok"].copy()
@@ -561,7 +561,7 @@ def run_soil_moisture_pipeline(
             
         return run_point(pergrid_path, "point", "point", tag,
                          lat, lon, calib, elev_table=elev_table,
-                         crop=crop, plant_day=plant_day,
+                         crop=crop, plant_doy=plant_doy,
                          daysbefore=daysbefore, out_dir=out_dir, save_csv=save_csv)
 
     villages = pd.read_csv(
@@ -579,7 +579,7 @@ def run_soil_moisture_pipeline(
         res_json = process_village(int(r.id), r.taluka, r.village,
                                    float(r.lat), float(r.lon), calib,
                                    elev_table=elev_table, crop=crop,
-                                   plant_day=plant_day,
+                                   plant_doy=plant_doy,
                                    daysbefore=daysbefore,
                                    pergrid_dir=pergrid_dir,
                                    out_dir=out_dir,
@@ -608,11 +608,11 @@ def main():
     # FAO-56 crop coefficient + irrigation (forwarded to cpc_leaky_bucket)
     ap.add_argument("--crop", choices=sorted(cpc.CROP_TABLE.keys()),
                     help="apply FAO-56 seasonal Kc for this crop")
-    ap.add_argument("--plant-day", type=int, default=None,
+    ap.add_argument("--plant-doy", type=int, default=None,
                     help="growing-season start day-of-year (with --crop). "
                          "If omitted, derived from the district crop calendar")
     ap.add_argument("--district",
-                    help="district name for crop-calendar plant-day lookup")
+                    help="district name for crop-calendar plant-doy lookup")
     ap.add_argument("--daysbefore", type=int,
                     help="deficit-refill irrigation this many days before "
                          "end of record")

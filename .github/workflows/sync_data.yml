@@ -1,0 +1,44 @@
+name: Sync Data to Hugging Face Storage
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "data/**"
+
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync data folder
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository (including Git LFS files)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Cache Git LFS objects
+        uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: ${{ runner.os }}-lfs-${{ hashFiles('data/**') }}
+          restore-keys: |
+            ${{ runner.os }}-lfs-
+
+      - name: Install Hugging Face CLI
+        run: |
+          curl -LsSf https://hf.co/cli/install.sh | bash
+
+      - name: Authenticate with Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          hf auth login --token "$HF_TOKEN"
+
+      - name: Sync data folder to Hugging Face Storage
+        run: |
+          hf sync ./data hf://buckets/ShaanNeedsHugs/farmRisk-storage
