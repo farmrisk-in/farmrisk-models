@@ -148,6 +148,16 @@ def get_health():
         "resolved_path": stats_path
     }
     
+    # Read data version.json
+    version_data = {"last_data_date": None, "version": None}
+    version_path = os.path.join(base_dir, "data", "version.json")
+    if os.path.exists(version_path):
+        try:
+            with open(version_path, "r") as f:
+                version_data = json.load(f)
+        except Exception:
+            pass
+
     status = "ok" if all_fine else "unhealthy"
 
     return {
