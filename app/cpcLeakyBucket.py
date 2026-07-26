@@ -16,8 +16,17 @@ where
     R    = surface + base runoff (CPC Bm-style, function of w/wmax)
     G    = linear groundwater loss = gamma * (w/wmax)
 
-Output: CSV with daily date, forcing, snowpack, w, E, R, G, and w as a
-fraction of wmax.
+Irrigation: an optional module adds irrigation as a water input sized by
+the demand formulation of VIC-WUR (Droppers et al. 2020), H08 (Hanasaki
+et al. 2008) and FAO-56 (Allen et al. 1998) rather than by refilling the
+column to saturation. Events are triggered on root-zone depletion
+relative to readily available water, capped by application efficiency
+and by a physical supply ceiling. See the IRRIGATION MODULE header for
+the full derivation, equation numbering and citations.
+
+Output: CSV with daily date, forcing, snowpack, w, E, R, G, w as a
+fraction of wmax, and (when irrigation is active) gross and net applied
+depths, root-zone storage w_rz, capacity TAW and depletion Dr.
 
 Usage:
     python cpc_leaky_bucket.py \
@@ -262,6 +271,12 @@ def penman_monteith_eto(tmax, tmin, dates, lat_deg, elev_m, pm=PM):
 #
 # Table 11 (stage lengths, days) and Table 12 (Kc_ini/mid/end + crop
 # height h, m) values below are FAO-56 defaults; Indian-relevant crops.
+# Keys match the crop names in the project's Unique_Crops list (uppercase).
+# Every row is traceable to FAO-56 Table 11 (stage lengths) and Table 12
+# (Kc_ini / Kc_mid / Kc_end and max crop height h); India-relevant Table 11
+# rows are preferred where listed. Aggregate categories (MINORPULSES,
+# OILSEEDS, FRUITS, VEGETABLES, etc.) use a representative crop and are
+# flagged as approximate.
 # ----------------------------------------------------------------------
 # crop -> (L_ini, L_dev, L_mid, L_late, Kc_ini, Kc_mid, Kc_end, h_m)
 CROP_TABLE = {
@@ -322,11 +337,11 @@ def climate_adjust_kc(kc_tab, h_m, rhmin_mean, u2, stage):
     return kc_tab
 
 
-def build_kc_series(dates, tmax, tmin, crop, plant_day, u2,
+def build_kc_series(dates, tmax, tmin, crop, plant_doy, u2,
                     stage_lengths=None, kc_values=None, height=None):
     """
     Build a daily Kc series over the full record for a repeating annual
-    growing season starting at plant_day each year. Returns a Series.
+    growing season starting at plant_doy each year. Returns a Series.
     """
     if crop is not None:
         (Li, Ld, Lm, Ll, kc_ini, kc_mid, kc_end, h) = CROP_TABLE[crop]
@@ -355,8 +370,8 @@ def build_kc_series(dates, tmax, tmin, crop, plant_day, u2,
     rhmin_ser = pd.Series(rhmin, index=dates)
 
     doy = np.asarray(dates.dayofyear, dtype=float)
-    # Day-into-season for each date (0 at plant_day), wrapping the year.
-    dis = (doy - plant_day) % 365.0
+    # Day-into-season for each date (0 at plant_doy), wrapping the year.
+    dis = (doy - plant_doy) % 365.0
 
     # Mean RHmin over mid and late windows (for Eq. 62/65), approximated
     # by the record-wide mean RHmin on days that fall in each stage.
@@ -422,26 +437,325 @@ def runoff(w, peff, p, wmax=WMAX):
     return r_surf + r_base
 
 
-# ----------------------------------------------------------------------
-# Irrigation (FAO-56 deficit-refill, single most-recent event)
+# ======================================================================
+# IRRIGATION MODULE
+# ======================================================================
 #
-# Irrigation enters the water balance as an effective water input on the
-# day it was applied, exactly like precipitation (pyfao56; Allen et al.
-# 1998, Ch. 8). The event is placed `daysbefore` days before the end of
-# the record and propagated forward by the normal bucket dynamics.
+# METHODOLOGY AND PROVENANCE
+# --------------------------
+# This module replaces the earlier "refill the bucket to WMAX" treatment
+# with the demand formulation standard in macroscale hydrological models
+# that carry an explicit irrigation scheme. Three literature strands are
+# combined; each is cited at the equation it supplies.
 #
-# Depth: FAO deficit-refill. The depth needed to return the root zone to
-# field capacity equals the current depletion,  D = WMAX - w(t). In
-# FAO-56 terms irrigation replenishes the depletion Dr back to Dr = 0
-# (field capacity). In this one-layer bucket, field capacity = WMAX.
-# Applied at 100% efficiency (no method/application-loss distinction).
-# ----------------------------------------------------------------------
+#   [1] Droppers, B., Franssen, W.H.P., van Vliet, M.T.H., Nijssen, B.,
+#       and Ludwig, F. (2020). Simulating human impacts on global water
+#       resources using VIC-5. Geoscientific Model Development 13,
+#       5029-5052. doi:10.5194/gmd-13-5029-2020.   [VIC-WUR]
+#   [2] Hanasaki, N., Kanae, S., Oki, T., Masuda, K., Motoya, K.,
+#       Shirakawa, N., Shen, Y., and Tanaka, K. (2008). An integrated
+#       model for the assessment of global water resources - Part 1 and
+#       Part 2. Hydrology and Earth System Sciences 12, 1007-1025 and
+#       1027-1037.                                  [H08]
+#   [3] Allen, R.G., Pereira, L.S., Raes, D., and Smith, M. (1998). Crop
+#       Evapotranspiration - Guidelines for Computing Crop Water
+#       Requirements. FAO Irrigation and Drainage Paper 56, Rome.
+#                                                    [FAO-56]
+#   [4] Huang, J., van den Dool, H.M., and Georgakakos, K.G. (1996).
+#       Analysis of model-calculated soil moisture over the US
+#       (1931-1993). Journal of Climate 9, 1350-1362.  [CPC bucket]
+#
+# ---------------------------------------------------------------------
+# 1. WHY THE PREVIOUS TREATMENT WAS PHYSICALLY WRONG
+# ---------------------------------------------------------------------
+# The prior code set  I = WMAX - w(t), i.e. it refilled the column to
+# saturation at 100% efficiency. Three independent errors:
+#
+#   (a) WRONG TARGET. In VIC-WUR [1, Eq. D1] conventional irrigation
+#       demand is triggered when soil moisture falls below the CRITICAL
+#       content at which evapotranspiration becomes limited, and the
+#       demand relieves exactly that stress:
+#           ID'_conventional = (Wcr,1 + Wcr,2) - (W1 + W2),
+#                              for W1 + W2 < Wcr,1 + Wcr,2
+#       The target is Wcr, NOT Wmax. Saturation is reserved in [1] for
+#       rice paddy alone [1, Eq. D2: ID'_paddy = Wmax,1 - W1], following
+#       [2]. Rainfed/well-irrigated rabi and kharif systems in semi-arid
+#       Marathwada are not paddy, so the paddy branch does not apply.
+#
+#   (b) NO EFFICIENCY. VIC-WUR [1, Eq. D3] converts net demand to gross
+#       withdrawal by the irrigation efficiency,  ID = ID' * IE, and
+#       notes that transport and application losses are "not lost but
+#       rather returned to the soil column without being used by the
+#       crop". A 100%-efficient application misstates both the depth
+#       withdrawn and the percolation signal.
+#
+#   (c) NO SUPPLY LIMIT. A cultivator abstracting from a 20-25 m dug
+#       well or an 80 m borewell cannot deliver unbounded depth in one
+#       day; pump discharge, plot size and labour bound the event.
+#
+# ---------------------------------------------------------------------
+# 2. ROOT-ZONE MAPPING  (the critical scaling step)
+# ---------------------------------------------------------------------
+# The CPC bucket's WMAX = 760 mm is NOT a plant-available water holding
+# capacity. It is a parameter tuned to reproduce observed runoff in
+# small eastern-Oklahoma basins; with an assumed porosity of 0.47 it
+# corresponds to a 1.6 m column [4; CPC Soil Moisture documentation].
+# It therefore represents TOTAL column storage over a depth far exceeding
+# the rooting depth of the crops of interest.
+#
+# FAO-56 quantities are defined over the ROOT ZONE and over PLANT-
+# AVAILABLE water only [3, Eqs. 82-83]:
+#       TAW = 1000 * (theta_FC - theta_WP) * Zr        [3, Eq. 82]
+#       RAW = p * TAW                                  [3, Eq. 83]
+# Applying "p * WMAX" directly to the CPC bucket would overstate RAW by
+# roughly a factor of three and defeat the purpose of the correction.
+#
+# We therefore introduce an explicit mapping. Let
+#       f_AW = (theta_FC - theta_WP) / porosity
+# be the plant-available fraction of total pore space, and
+#       f_Zr = Zr / Z_col
+# the fraction of the modelled column occupied by roots. Then
+#       TAW = WMAX * f_AW * f_Zr                              (Eq. I1)
+# and the root-zone storage tracked against that capacity is the same
+# fraction of the bucket:
+#       w_rz(t) = w(t) * f_AW * f_Zr                          (Eq. I2)
+# so that the storage RATIO is preserved, w_rz/TAW = w/WMAX. Depletion
+# in FAO-56 terms is then
+#       Dr(t) = TAW - w_rz(t)                                 (Eq. I3)
+#
+# IMPORTANT - direction of use. Eqs. I1-I3 map the model STATE into
+# FAO-56 units so that the trigger and depth can be evaluated against
+# agronomically meaningful thresholds. They are NOT a unit conversion
+# for the applied FLUX. Irrigation depth is an absolute quantity of
+# water per unit field area and enters the column balance unscaled,
+# exactly as precipitation does. Dividing the depth by f to "return it
+# to column units" would inject roughly 1/f times the water actually
+# applied and would violate mass conservation. Because the CPC column
+# is deeper than the root zone, a given application therefore raises
+# w/WMAX by less than it raises the notional root-zone fraction; this
+# is the physically correct behaviour, since water applied at the
+# surface is distributed through, and drains from, the whole column.
+#
+# Defaults: theta_FC = 0.32, theta_WP = 0.17 for the medium-to-deep
+# clayey and gravelly clay-loam soils typical of the Osmanabad/Tuljapur
+# cluster; porosity 0.47 to stay consistent with the CPC column
+# definition; Z_col = 1.6 m. This yields f_AW = 0.319. With Zr = 1.0 m,
+# f_Zr = 0.625 and TAW = 760 * 0.319 * 0.625 = 151.6 mm, which is the
+# physically expected order for a 1 m root zone and consistent with the
+# H08 bucket, where Smax = SD * (fFC - fWP) with defaults SD = 1 m,
+# fFC = 0.30, fWP = 0.15 giving 150 mm [2].
+#
+# ---------------------------------------------------------------------
+# 3. TRIGGER  (management-allowed depletion)
+# ---------------------------------------------------------------------
+# An event fires when root-zone depletion reaches readily available
+# water [3, Eqs. 83, 84] - the operational form of the VIC-WUR critical
+# threshold [1, Eq. D1]:
+#       irrigate when  Dr(t) >= RAW = p_adj * TAW             (Eq. I4)
+# The tabulated depletion fraction is adjusted for atmospheric demand
+# [3, Table 22 note; p typically 0.30-0.65]:
+#       p_adj = p_table + 0.04 * (5 - ETc),  clipped to [0.1, 0.8]
+#                                                             (Eq. I5)
+# so that under high evaporative demand the crop stresses at a smaller
+# depletion and the cultivator irrigates sooner.
+#
+# ---------------------------------------------------------------------
+# 4. DEPTH  (net, gross, and the three binding constraints)
+# ---------------------------------------------------------------------
+# Net depth targets field capacity, optionally under deficit irrigation
+# with refill fraction f_r <= 1:
+#       I_net = min( f_r * Dr(t),  I_net_cap )                (Eq. I6)
+# Gross withdrawal follows VIC-WUR Eq. D3:
+#       I_gross = I_net / Ea                                  (Eq. I7)
+# subject to the supply ceiling, with net back-computed if it binds:
+#       I_gross = min(I_gross, I_supply_cap);  I_net = I_gross * Ea
+#                                                             (Eq. I8)
+# Following [1], application losses are returned to the soil column
+# rather than discarded, so the depth entering the water balance is the
+# GROSS depth; the loss fraction I_gross*(1-Ea) is then free to leave
+# through the model's existing runoff and drainage terms. The gross
+# depth is expressed back in bucket units by inverting Eq. I2.
+#
+# Application efficiencies Ea are the FAO/field-study consensus values:
+# subsurface drip ~0.90, centre pivot / linear ~0.85, sprinkler ~0.75,
+# furrow and surface flood ~0.55-0.65. Surface flood is the dominant
+# method for all crops except groundnut in semi-arid Indian smallholder
+# catchments, so `flood` is the default here.
+#
+# ---------------------------------------------------------------------
+# 5. TWO OPERATING MODES
+# ---------------------------------------------------------------------
+#   SCHEDULED (--daysbefore N): a single counterfactual event N days
+#       before the end of record. Answers "what does the profile look
+#       like if the cultivator irrigated N days ago?" Depth is sized by
+#       Eqs. I6-I8 rather than by saturation. This preserves the
+#       existing CLI contract.
+#   AUTOMATIC (--irrigate): the trigger of Eq. I4 is evaluated every
+#       day, subject to a minimum inter-event interval representing
+#       pump/labour availability. Answers "what irrigation does this
+#       forcing imply?" and yields a full season schedule.
+# The two are mutually exclusive.
+# ======================================================================
+
+
+# Application efficiency Ea (root-zone delivery per unit withdrawn) and
+# per-event depth ceilings (mm) by method. Ea after FAO/field practice
+# (see Sec. 4 above); caps reflect single-event depths feasible for
+# smallholder abstraction in the pilot cluster.
+IRRIG_METHODS = {
+    "flood":     {"Ea": 0.60, "I_net_cap": 50.0, "supply_cap": 60.0},
+    "furrow":    {"Ea": 0.60, "I_net_cap": 45.0, "supply_cap": 60.0},
+    "border":    {"Ea": 0.65, "I_net_cap": 50.0, "supply_cap": 65.0},
+    "sprinkler": {"Ea": 0.75, "I_net_cap": 35.0, "supply_cap": 45.0},
+    "pivot":     {"Ea": 0.85, "I_net_cap": 30.0, "supply_cap": 35.0},
+    "drip":      {"Ea": 0.90, "I_net_cap": 20.0, "supply_cap": 25.0},
+}
+
+# FAO-56 Table 22 depletion fractions p for crops of the pilot cluster.
+# Fallback 0.50 where a crop is absent.
+CROP_P = {
+    "soybean": 0.50, "cotton": 0.65, "sorghum": 0.55, "wheat": 0.55,
+    "maize": 0.55, "chickpea": 0.50, "pigeonpea": 0.50, "groundnut": 0.50,
+    "greengram": 0.45, "onion": 0.30, "tomato": 0.40, "potato": 0.35,
+    "sugarcane": 0.65, "grapes": 0.35, "sunflower": 0.45, "millet": 0.55,
+}
+
+# Root-zone mapping defaults (Sec. 2). Soil water contents are volumetric.
+ROOTZONE = dict(
+    theta_fc=0.32,   # field capacity, medium/deep clayey soils
+    theta_wp=0.17,   # wilting point
+    porosity=0.47,   # CPC column porosity, keeps WMAX self-consistent
+    z_col=1.6,       # CPC modelled column depth (m)
+    zr=1.0,          # crop rooting depth (m)
+)
+
+
+def rootzone_scale(rz=ROOTZONE):
+    """Fraction of bucket storage that is plant-available root-zone water.
+
+    Returns f = f_AW * f_Zr such that TAW = WMAX * f and w_rz = w * f
+    (Eqs. I1, I2). Preserves the storage ratio w/WMAX.
+    """
+    f_aw = (rz["theta_fc"] - rz["theta_wp"]) / rz["porosity"]
+    f_zr = min(rz["zr"] / rz["z_col"], 1.0)
+    return float(np.clip(f_aw * f_zr, 1e-3, 1.0))
+
+
+def adjusted_p(p_table, etc_mm):
+    """FAO-56 demand adjustment, Eq. I5.  p_adj = p + 0.04*(5 - ETc)."""
+    return float(np.clip(p_table + 0.04 * (5.0 - etc_mm), 0.1, 0.8))
+
+
+def irrigation_demand(w, wmax, etc_mm, cfg):
+    """Depth for one potential irrigation event. All depths in mm.
+
+    Implements Eqs. I3-I8. Operates on the CPC bucket state `w` but
+    evaluates the trigger in FAO-56 root-zone terms.
+
+    Parameters
+    ----------
+    w      : current bucket storage (mm, CPC column units)
+    wmax   : bucket capacity (mm, CPC column units)
+    etc_mm : crop water demand for the day (mm), for the p adjustment
+    cfg    : dict with keys p, Ea, I_net_cap, supply_cap, refill_frac,
+             rz_scale, adjust_p
+
+    Returns
+    -------
+    dict: applied, I_gross_bucket (mm, to add to the water balance),
+          I_gross, I_net, I_loss, Dr, TAW, RAW, p_adj, limited_by
+    """
+    f = cfg["rz_scale"]
+    taw = wmax * f                       # Eq. I1
+    w_rz = w * f                         # Eq. I2
+    dr = max(taw - w_rz, 0.0)            # Eq. I3
+
+    p_adj = adjusted_p(cfg["p"], etc_mm) if cfg["adjust_p"] else cfg["p"]
+    raw = p_adj * taw
+
+    res = dict(applied=False, I_gross_bucket=0.0, I_gross=0.0, I_net=0.0,
+               I_loss=0.0, Dr=dr, TAW=taw, RAW=raw, p_adj=p_adj,
+               limited_by="no_trigger")
+
+    if dr < raw:                         # Eq. I4 not met: no stress
+        return res
+
+    i_net = dr * cfg["refill_frac"]      # Eq. I6
+    limited = "demand"
+    if i_net > cfg["I_net_cap"]:
+        i_net = cfg["I_net_cap"]
+        limited = "I_net_cap"
+
+    i_gross = i_net / cfg["Ea"]          # Eq. I7
+    if i_gross > cfg["supply_cap"]:      # Eq. I8
+        i_gross = cfg["supply_cap"]
+        i_net = i_gross * cfg["Ea"]
+        limited = "supply_cap"
+
+    # The applied depth is an ABSOLUTE quantity of water (mm over the
+    # field) and enters the column water balance unscaled, exactly like
+    # precipitation. The root-zone mapping (Eqs. I1-I3) is a diagnostic
+    # for sizing the event, not a unit conversion for the flux: scaling
+    # the depth by 1/f would inject several times the water the
+    # cultivator actually applied and would not conserve mass.
+    res.update(applied=True,
+               I_gross_bucket=i_gross,
+               I_gross=i_gross, I_net=i_net, I_loss=i_gross - i_net,
+               limited_by=limited)
+    return res
+
+
+def build_irrig_config(method="flood", p=None, crop=None, Ea=None,
+                       net_cap=None, supply_cap=None, refill_frac=1.0,
+                       min_interval=5, adjust_p=True, rz=ROOTZONE):
+    """Assemble the irrigation parameter set, applying method presets."""
+    preset = IRRIG_METHODS.get(method, IRRIG_METHODS["flood"])
+    if p is None:
+        p = CROP_P.get((crop or "").lower(), 0.50)
+    cfg = dict(
+        method=method,
+        p=float(p),
+        Ea=float(Ea if Ea is not None else preset["Ea"]),
+        I_net_cap=float(net_cap if net_cap is not None
+                        else preset["I_net_cap"]),
+        supply_cap=float(supply_cap if supply_cap is not None
+                         else preset["supply_cap"]),
+        refill_frac=float(refill_frac),
+        min_interval=int(min_interval),
+        adjust_p=bool(adjust_p),
+        rz_scale=rootzone_scale(rz),
+    )
+    if not 0.05 < cfg["Ea"] <= 1.0:
+        sys.exit(f"ERROR: irrigation efficiency must be in (0.05, 1.0], "
+                 f"got {cfg['Ea']}")
+    if not 0.05 < cfg["p"] <= 0.9:
+        sys.exit(f"ERROR: depletion fraction p must be in (0.05, 0.9], "
+                 f"got {cfg['p']}")
+    if not 0.0 < cfg["refill_frac"] <= 1.0:
+        sys.exit(f"ERROR: refill fraction must be in (0, 1], "
+                 f"got {cfg['refill_frac']}")
+    return cfg
 
 
 def run_model(precip, tmean, pe, lat, params=PARAMS, snow=True,
               w0_frac=0.5, spinup_years=1, irrig_daysbefore=None,
-              wmax=WMAX, snow_params=None):
-    """Run the daily water balance. Returns a DataFrame of states/fluxes."""
+              wmax=WMAX, snow_params=None,
+              irrig_cfg=None, irrig_auto=False):
+    """Run the daily water balance. Returns a DataFrame of states/fluxes.
+
+    Irrigation (see IRRIGATION MODULE above) operates in one of two
+    mutually exclusive modes:
+      * scheduled: `irrig_daysbefore` sets a single event that many days
+        before the end of record, sized by Eqs. I6-I8.
+      * automatic: `irrig_auto=True` evaluates the FAO-56 trigger
+        (Eq. I4) every day, honouring cfg['min_interval'].
+    `irrig_cfg` comes from build_irrig_config(); if None while a mode is
+    requested, defaults (surface flood, p from crop table) are used.
+
+    `wmax` and `snow_params` are passed per-point so that concurrent
+    callers (e.g. the API server driving many villages) never mutate
+    shared module state.
+    """
     if snow_params is None:
         snow_params = SNOW
     idx = precip.index
@@ -449,16 +763,21 @@ def run_model(precip, tmean, pe, lat, params=PARAMS, snow=True,
     w = w0_frac * wmax
     snowpack = 0.0
 
-    # Single irrigation event: index of the day it was applied. The event
-    # is `irrig_daysbefore` days before the last record. Deficit-refill
-    # depth is computed in-loop from w(t).
+    if irrig_daysbefore is not None and irrig_auto:
+        sys.exit("ERROR: --daysbefore and --irrigate are mutually exclusive")
+
+    # Single scheduled event: index of the day it was applied.
     irrig_k = None
     if irrig_daysbefore is not None:
         if irrig_daysbefore < 0 or irrig_daysbefore >= n:
             sys.exit(f"ERROR: --daysbefore must be in [0, {n-1}]")
         irrig_k = n - 1 - irrig_daysbefore
 
-    out = np.zeros((n, 7))  # peff, snow, w, E, R, G, irrig
+    if (irrig_k is not None or irrig_auto) and irrig_cfg is None:
+        irrig_cfg = build_irrig_config()
+    last_event = -10 ** 9
+
+    out = np.zeros((n, 9))  # peff, snow, w, E, R, G, irrig, irrig_net, Dr
     pv = precip.values
     tv = tmean.values
     ev = pe.values
@@ -474,18 +793,28 @@ def run_model(precip, tmean, pe, lat, params=PARAMS, snow=True,
 
         pe_k = ev[k] if not np.isnan(ev[k]) else 0.0
 
-        # --- Irrigation (single deficit-refill event) ---
-        # Depth to bring storage back to field capacity (= WMAX), applied
-        # at 100% efficiency.
+        # --- Irrigation (Eqs. I3-I8) ---------------------------------
+        # Gross depth enters the balance exactly like precipitation
+        # (FAO-56 Ch. 8); application losses stay in the column and
+        # leave via the existing runoff/drainage terms, after VIC-WUR.
         irrig = 0.0
-        if irrig_k is not None and k == irrig_k:
-            irrig = max(0.0, wmax - w)
-            peff += irrig
+        irrig_net = 0.0
+        dr_k = np.nan
+        if irrig_cfg is not None:
+            due = (irrig_k is not None and k == irrig_k) or (
+                irrig_auto and (k - last_event) >= irrig_cfg["min_interval"])
+            if due:
+                evt = irrigation_demand(w, wmax, pe_k, irrig_cfg)
+                dr_k = evt["Dr"]
+                if evt["applied"]:
+                    irrig = evt["I_gross_bucket"]
+                    irrig_net = evt["I_net"]
+                    peff += irrig
+                    last_event = k
 
         # Fluxes evaluated on the storage at start of step (explicit).
         E = beta(w, wmax=wmax) * pe_k
         R = runoff(w, peff, params, wmax=wmax)
-        G = params["gamma"] * (w / wmax) # wait, the original was G = params["gamma"] * (w / WMAX) - but let's change to wmax since we are refactoring. Wait, is it w/WMAX or w/wmax? It's the storage fraction so it should be w/wmax.
         G = params["gamma"] * (w / wmax)
 
         w_new = w + peff - E - R - G
@@ -504,24 +833,31 @@ def run_model(precip, tmean, pe, lat, params=PARAMS, snow=True,
                 G -= G / total_loss * deficit
             w_new = 0.0
 
-        out[k] = (peff, snowpack, w_new, E, R, G, irrig)
+        out[k] = (peff, snowpack, w_new, E, R, G, irrig, irrig_net, dr_k)
         w = w_new
 
     df = pd.DataFrame(
         out, index=idx,
-        columns=["P_eff", "snowpack", "w", "E", "R", "G", "irrig"],
+        columns=["P_eff", "snowpack", "w", "E", "R", "G", "irrig",
+                 "irrig_net", "Dr"],
     )
     df["P_obs"] = precip.values
     df["Tmean"] = tmean.values
     df["PE"] = pe.values
     df["w_frac"] = df["w"] / wmax
 
+    # Root-zone storage in FAO-56 terms (Eqs. I1-I2). Reported so that
+    # irrigation depths and the state they act on share one unit system.
+    f = irrig_cfg["rz_scale"] if irrig_cfg is not None else rootzone_scale()
+    df["w_rz"] = df["w"] * f
+    df["TAW"] = wmax * f
+
     # Drop spin-up.
     if spinup_years > 0:
         cutoff = idx[0] + pd.DateOffset(years=spinup_years)
         df = df[df.index >= cutoff]
-    return df[["P_obs", "Tmean", "PE", "P_eff", "irrig", "snowpack",
-               "w", "E", "R", "G", "w_frac"]]
+    return df[["P_obs", "Tmean", "PE", "P_eff", "irrig", "irrig_net", "Dr",
+               "snowpack", "w", "w_rz", "TAW", "E", "R", "G", "w_frac"]]
 
 
 # ----------------------------------------------------------------------
@@ -537,13 +873,25 @@ def cpc_leaky_bucket_pipeline(
     w0=0.5,
     spinup=1,
     crop=None,
-    plant_day=1,
+    plant_doy=1,
     kc_stages=None,
     kc_values=None,
     crop_height=None,
     elev_file=None,
     lon=None,
     daysbefore=None,
+    irrigate=False,
+    irr_method="flood",
+    irr_p=None,
+    irr_efficiency=None,
+    irr_net_cap=None,
+    irr_supply_cap=None,
+    irr_refill_frac=1.0,
+    irr_min_interval=5,
+    irr_no_et_adjust=False,
+    irr_root_depth=ROOTZONE["zr"],
+    irr_theta_fc=ROOTZONE["theta_fc"],
+    irr_theta_wp=ROOTZONE["theta_wp"],
 ):
     if base and not (pcp and tmax and tmin):
         pcp, tmax, tmin = derive_paths(base)
@@ -588,16 +936,33 @@ def cpc_leaky_bucket_pipeline(
     if crop is not None or kc_values is not None:
         kc = build_kc_series(
             df.index, df["tmax"], df["tmin"],
-            crop=crop, plant_day=plant_day, u2=PM["u2"],
+            crop=crop, plant_doy=plant_doy, u2=PM["u2"],
             stage_lengths=kc_stages, kc_values=kc_values,
             height=crop_height,
         )
         pe = pe * kc          # ETc = Kc * ETo
 
+    # Irrigation configuration (see IRRIGATION MODULE, Secs. 2-4).
+    irrig_cfg = None
+    if daysbefore is not None or irrigate:
+        rz = dict(ROOTZONE, zr=irr_root_depth,
+                  theta_fc=irr_theta_fc, theta_wp=irr_theta_wp)
+        if rz["theta_fc"] <= rz["theta_wp"]:
+            sys.exit("ERROR: irr_theta_fc must exceed irr_theta_wp")
+        irrig_cfg = build_irrig_config(
+            method=irr_method, p=irr_p, crop=crop,
+            Ea=irr_efficiency, net_cap=irr_net_cap,
+            supply_cap=irr_supply_cap,
+            refill_frac=irr_refill_frac,
+            min_interval=irr_min_interval,
+            adjust_p=not irr_no_et_adjust, rz=rz,
+        )
+
     result = run_model(
         df["pcp"], tmean, pe, lat,
         snow=not no_snow, w0_frac=w0, spinup_years=spinup,
         irrig_daysbefore=daysbefore,
+        irrig_cfg=irrig_cfg, irrig_auto=irrigate,
     )
     if out:
         result.to_csv(out, float_format="%.3f",
@@ -625,7 +990,7 @@ def main():
     ap.add_argument("--crop", choices=sorted(CROP_TABLE.keys()),
                     help="apply FAO-56 seasonal Kc for this crop; "
                          "omit for bare reference ET (Kc=1)")
-    ap.add_argument("--plant-day", type=int, default=1,
+    ap.add_argument("--plant-doy", type=int, default=1,
                     help="growing-season start day-of-year (repeats yearly)")
     ap.add_argument("--kc-stages", type=int, nargs=4,
                     metavar=("LINI", "LDEV", "LMID", "LLATE"),
@@ -641,10 +1006,42 @@ def main():
     ap.add_argument("--lon", type=float,
                     help="point longitude for --elev-file lookup "
                          "(parsed from filename if omitted)")
-    # --- Irrigation (FAO-56 deficit-refill, single most-recent event) ---
-    ap.add_argument("--daysbefore", type=int,
-                    help="refill root zone to field capacity this many days "
-                         "before the end of record (0 = last day)")
+    # --- Irrigation (VIC-WUR / H08 / FAO-56; see IRRIGATION MODULE) ---
+    g = ap.add_argument_group("irrigation")
+    g.add_argument("--daysbefore", type=int,
+                   help="scheduled mode: one irrigation event this many "
+                        "days before the end of record (0 = last day). "
+                        "Depth is demand-based, not saturating.")
+    g.add_argument("--irrigate", action="store_true",
+                   help="automatic mode: fire the FAO-56 depletion trigger "
+                        "(Dr >= RAW) whenever it is met")
+    g.add_argument("--irr-method", default="flood",
+                   choices=sorted(IRRIG_METHODS),
+                   help="application method; sets efficiency and depth caps "
+                        "(default: flood, dominant in the pilot cluster)")
+    g.add_argument("--irr-p", type=float, default=None,
+                   help="FAO-56 depletion fraction p (MAD). Default: from "
+                        "the crop table, else 0.50")
+    g.add_argument("--irr-efficiency", type=float, default=None,
+                   help="application efficiency Ea; overrides method preset")
+    g.add_argument("--irr-net-cap", type=float, default=None,
+                   help="maximum NET depth per event (mm)")
+    g.add_argument("--irr-supply-cap", type=float, default=None,
+                   help="maximum GROSS depth per event (mm): well/pump limit")
+    g.add_argument("--irr-refill-frac", type=float, default=1.0,
+                   help="1.0 refills to field capacity; <1.0 gives deficit "
+                        "irrigation")
+    g.add_argument("--irr-min-interval", type=int, default=5,
+                   help="minimum days between events in automatic mode")
+    g.add_argument("--irr-no-et-adjust", action="store_true",
+                   help="disable the FAO-56 p adjustment for daily ETc")
+    g.add_argument("--irr-root-depth", type=float, default=ROOTZONE["zr"],
+                   help="crop rooting depth Zr (m) for the root-zone "
+                        "mapping (Eq. I1)")
+    g.add_argument("--irr-theta-fc", type=float, default=ROOTZONE["theta_fc"],
+                   help="volumetric field capacity for the root-zone mapping")
+    g.add_argument("--irr-theta-wp", type=float, default=ROOTZONE["theta_wp"],
+                   help="volumetric wilting point for the root-zone mapping")
     args = ap.parse_args()
 
     cpc_leaky_bucket_pipeline(
@@ -659,13 +1056,25 @@ def main():
         w0=args.w0,
         spinup=args.spinup,
         crop=args.crop,
-        plant_day=args.plant_day,
+        plant_doy=args.plant_doy,
         kc_stages=args.kc_stages,
         kc_values=args.kc_values,
         crop_height=args.crop_height,
         elev_file=args.elev_file,
         lon=args.lon,
         daysbefore=args.daysbefore,
+        irrigate=args.irrigate,
+        irr_method=args.irr_method,
+        irr_p=args.irr_p,
+        irr_efficiency=args.irr_efficiency,
+        irr_net_cap=args.irr_net_cap,
+        irr_supply_cap=args.irr_supply_cap,
+        irr_refill_frac=args.irr_refill_frac,
+        irr_min_interval=args.irr_min_interval,
+        irr_no_et_adjust=args.irr_no_et_adjust,
+        irr_root_depth=args.irr_root_depth,
+        irr_theta_fc=args.irr_theta_fc,
+        irr_theta_wp=args.irr_theta_wp,
     )
 
 
