@@ -2,7 +2,11 @@ name: Sync to Hugging Face Hub
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+    paths-ignore:
+      - "data/**"
+
   workflow_dispatch:
 
 jobs:
