@@ -55,10 +55,97 @@ warnings.filterwarnings("ignore")
 # -- Config --------------------------------------------------------------------
 
 RAIN_THRESHOLD = 1.0
-TRAIN_END = "2024-12-31"        # train on data up to end of 2024
-TEST_START = "2025-01-01"       # hold out 2025+ for skill evaluation
 GRID_STEP = 0.25
 GRID_OFFSET = 0.125
+
+# -- Cross-validation (replaces the single 2025+ chronological holdout) --------
+# Skill is now reported via BLOCKED-BY-YEAR K-fold CV: each fold holds out one
+# or more whole calendar years, trains on the rest, and evaluates on the held-
+# out year(s). Blocking by year (not random rows) prevents leakage from temporal
+# autocorrelation and from rolling/climatology features that would otherwise let
+# near-adjacent days sit in both train and test. The FINAL production model that
+# generates the live forecast is trained on the WHOLE timeseries — CV is only
+# for honest skill estimation.
+CV_N_FOLDS = 5                 # target number of year-blocks (<= available years)
+
+# -- Per-variable training source ---------------------------------------------
+# The global --train_source flag sets the default, but ERA5 helps some variables
+# and hurts others: ERA5's tmin (and tmax) bias vs IMD drags an already-accurate
+# raw temperature the wrong way, while precip benefits from the extra rows. This
+# map overrides the flag per variable. Set an entry to None to fall back to the
+# CLI flag. Values: "om", "era5", or "both".
+PER_VAR_TRAIN_SOURCE = {"tmax": "om", "tmin": "om", "pcp": "both"}
+
+# -- Tail blend for precip (ratio model + QM on heavy days) --------------------
+# The anchored ratio model is the per-day corrector, but across all wet days it
+# mean-reverts and UNDER-corrects the heavy tail (corrected P90 < IMD P90). QM
+# fixes the tail magnitude but misplaces it day-to-day. So on heavy raw days we
+# blend the two: below PCP_BLEND_LO_MM use the ratio model alone; above
+# PCP_BLEND_HI_MM use PCP_BLEND_QM_WEIGHT of QM; linear ramp in between. This
+# lifts the tail toward IMD's P90 while keeping ratio-model per-day skill on
+# ordinary days. Set PCP_BLEND_QM_WEIGHT = 0 to disable the blend entirely.
+PCP_BLEND_LO_MM = 15.0
+PCP_BLEND_HI_MM = 30.0
+PCP_BLEND_QM_WEIGHT = 0.5
+
+# -- Empirical (piecewise) quantile mapping ------------------------------------
+# Instead of one smooth OM->IMD quantile curve, the empirical map is built band
+# by band so the heavy tail is mapped on its own resolution. Bands are given as
+# quantile edges over WET days (om>=1 & imd>=1): deciles up to the 80th, then a
+# finer split in the tail (80-90-95-100) where the extreme bias lives.
+QM_BAND_EDGES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0]
+
+# --- Precipitation correction (anchored, multiplicative) ---------------------
+# The precip corrector no longer predicts an absolute value that can collapse
+# on extremes. It learns a log correction ratio log(imd / om) and multiplies
+# the RAW forecast by exp(pred). The ratio is clipped so the corrected value
+# can never wander too far from the raw forecast — only nudged by the learned
+# historical bias. Bounds are in multiplicative space:
+#   PCP_RATIO_MIN = 0.5  -> corrected can drop to at most 50% of raw
+#   PCP_RATIO_MAX = 2.0  -> corrected can rise to at most 200% of raw
+# --- Precipitation correction (anchored, multiplicative) ---------------------
+# The precip corrector no longer predicts an absolute value that can collapse
+# on extremes. It learns a log correction ratio log(imd / om) and multiplies
+# the RAW forecast by exp(pred). The ratio is clipped so the corrected value
+# can never wander too far from the raw forecast — only nudged by the learned
+# historical bias.
+#
+# The MAX multiplier is REGIME-DEPENDENT, not flat. Analysis of extreme days
+# shows OM often under-forecasts heavy rain by 3-6x while ordinary/drizzle days
+# need only small tweaks. A single flat cap forces a bad trade-off: tight enough
+# for drizzle means it strangles genuine extremes; loose enough for extremes
+# means drizzle days get over-inflated. So the cap scales with the raw forecast:
+#   - near RAIN_THRESHOLD  -> cap = PCP_RATIO_MAX_LOW  (stay anchored)
+#   - at/above PCP_HEAVY_MM -> cap = PCP_RATIO_MAX_HIGH (let extremes correct)
+# interpolated linearly in between. The floor (min multiplier) stays flat.
+PCP_RATIO_MIN = 0.5          # corrected can drop to at most 50% of raw
+PCP_RATIO_MAX_LOW = 2.0      # cap when raw forecast is light (~RAIN_THRESHOLD)
+PCP_RATIO_MAX_HIGH = 6.0     # cap when raw forecast is already heavy
+PCP_HEAVY_MM = 20.0          # raw mm at which the cap reaches PCP_RATIO_MAX_HIGH
+PCP_LOG_RATIO_MIN = float(np.log(PCP_RATIO_MIN))
+# Training-target clip uses the HIGH cap so the model is free to learn large
+# ratios; the regime cap is then applied at apply/eval time based on raw mm.
+PCP_LOG_RATIO_MAX = float(np.log(PCP_RATIO_MAX_HIGH))
+
+
+def _pcp_max_log_ratio(om):
+    """
+    Regime-dependent upper log-ratio cap, as a function of the raw forecast (mm).
+
+    Ramps linearly from PCP_RATIO_MAX_LOW at om=RAIN_THRESHOLD to
+    PCP_RATIO_MAX_HIGH at om>=PCP_HEAVY_MM. Below RAIN_THRESHOLD the low cap is
+    used (those rows aren't scaled anyway). Returned in log space, elementwise.
+    """
+    om = np.asarray(om, dtype=float)
+    span = max(PCP_HEAVY_MM - RAIN_THRESHOLD, 1e-6)
+    frac = np.clip((om - RAIN_THRESHOLD) / span, 0.0, 1.0)
+    max_ratio = PCP_RATIO_MAX_LOW + frac * (PCP_RATIO_MAX_HIGH - PCP_RATIO_MAX_LOW)
+    return np.log(max_ratio)
+
+# Extreme-precip skill reporting: MAE is also reported on days where IMD is at
+# or above this percentile (computed over the wet test days), so the skill line
+# reflects performance in the heavy-rain regime that matters most.
+PCP_EXTREME_PCTL = 90.0
 
 OUTPUT_PAST_DAYS = 85           # past days to include in the corrected output
 ROLL_BUFFER = 7                 # extra past days fetched only to warm up om_roll7
@@ -315,17 +402,16 @@ def build_grid_training(era5_dir, forecast_path, imd_dir, elev_path,
         combined["rain_om"] = (combined["om"] >= RAIN_THRESHOLD).astype(np.int8)
         combined["om_log"] = np.log1p(combined["om"].clip(lower=0))
 
-    # -- Split into per-grid dict: train (<=2024) and test (2025+) --
-    # TRAIN uses whatever sources were loaded (train_source). TEST is always
-    # OM-only (source==1), because OM is what we correct at apply time — this
-    # keeps the skill number honest regardless of train_source.
-    train_cutoff = pd.Timestamp(TRAIN_END)
-    test_cutoff = pd.Timestamp(TEST_START)
+    # -- Split into per-grid dict: FULL timeseries per grid --
+    # No chronological holdout anymore. The whole OM+ERA5 timeseries is kept per
+    # grid; blocked-by-year CV (see cv_evaluate_pcp) carves out folds for skill,
+    # and the final production model trains on everything. A `year` column is
+    # attached to drive year-blocked folding.
     grid_data = {}
     for (lat, lon), gdf in combined.groupby(["lat", "lon"]):
-        train = gdf[gdf["date"] <= train_cutoff]
-        test = gdf[(gdf["date"] >= test_cutoff) & (gdf["source"] == 1)]
-        grid_data[(round(lat, 4), round(lon, 4))] = {"train": train, "test": test}
+        gdf = gdf.copy()
+        gdf["year"] = gdf["date"].dt.year
+        grid_data[(round(lat, 4), round(lon, 4))] = {"full": gdf}
     return grid_data
 
 
@@ -333,87 +419,332 @@ def build_grid_training(era5_dir, forecast_path, imd_dir, elev_path,
 # IN-MEMORY MODEL TRAINING  (no disk writes)
 # ==============================================================================
 
-def _eval_temp(model, feat, test):
-    """Return (raw_mae, corr_mae, n) on the 2025+ test split for temperature."""
-    if test is None or len(test) == 0:
-        return None, None, 0
-    tv = test.dropna(subset=["imd"])
-    if len(tv) == 0:
-        return None, None, 0
-    pred = model.predict(tv[feat].values)
-    raw = float(np.abs(tv["om"].values - tv["imd"].values).mean())
-    corr = float(np.abs(pred - tv["imd"].values).mean())
-    return raw, corr, len(tv)
-
-
-def _eval_pcp(cls_model, cls_feat, reg_model, reg_feat, test):
-    """Return (raw_mae, corr_mae, n) on the 2025+ test split for precipitation."""
-    if test is None or len(test) == 0:
-        return None, None, 0
-    tv = test.dropna(subset=["imd"])
-    if len(tv) == 0:
-        return None, None, 0
-    om_t = tv["om"].values
-    imd_t = tv["imd"].values
-    raw = float(np.abs(om_t - imd_t).mean())
-    cls_pred = cls_model.predict(tv[cls_feat].values)
-    pred = np.copy(om_t)
-    above = om_t >= RAIN_THRESHOLD
-    pred[above & (cls_pred == 0)] = 0.0
-    correct = above & (cls_pred == 1)
-    if correct.sum() > 0:
-        lp = reg_model.predict(tv[correct][reg_feat].values)
-        pred[correct] = np.maximum(np.expm1(lp), RAIN_THRESHOLD)
-    corr = float(np.abs(pred - imd_t).mean())
-    return raw, corr, len(tv)
-
-
-def train_grid_model(train, test, var_key):
+def _apply_pcp_correction(om, cls_pred, log_ratio):
     """
-    Train a single grid's model on <=2024 data and evaluate on 2025+ test.
-    Returns a model-data dict (with raw_mae/corr_mae/test_n) or None.
+    Anchored multiplicative precip correction.
+
+    Starts from the RAW forecast and only adjusts it:
+      - classifier can zero out a raw wet day it judges to be spurious drizzle
+      - regressor supplies a log correction ratio; corrected = om * exp(ratio),
+        with the ratio clipped between PCP_RATIO_MIN and a REGIME-DEPENDENT max
+        (bigger for heavier raw forecasts) so genuine extremes can correct hard
+        while drizzle days stay tightly anchored.
+    """
+    pred = np.array(om, dtype=float, copy=True)
+    above = om >= RAIN_THRESHOLD
+    # classifier only allowed to *remove* a raw wet day (spurious drizzle),
+    # never to invent rain the raw forecast didn't have.
+    pred[above & (cls_pred == 0)] = 0.0
+    keep = above & (cls_pred == 1)
+    if keep.any():
+        # Regime-dependent cap: heavy raw days may correct up to
+        # PCP_RATIO_MAX_HIGH, light days only up to PCP_RATIO_MAX_LOW.
+        hi_cap = _pcp_max_log_ratio(om[keep])
+        r = np.clip(log_ratio[keep], PCP_LOG_RATIO_MIN, hi_cap)
+        pred[keep] = om[keep] * np.exp(r)
+    return pred
+
+
+# ------------------------------------------------------------------------------
+# Empirical (piecewise) quantile mapping
+# ------------------------------------------------------------------------------
+
+def build_empirical_qm(om_train, imd_train, band_edges=QM_BAND_EDGES):
+    """
+    Build a piecewise OM->IMD quantile map from WET training pairs.
+
+    For each quantile band (e.g. 80-90th, 90-95th, 95-100th) we record the OM
+    edge values and the matching IMD quantile values. Applying the map means:
+    locate a new OM value's quantile within OM's wet distribution, then read the
+    IMD value at that same quantile. Building it band-by-band (deciles + a finer
+    tail split) lets the heavy tail be mapped on its own resolution instead of
+    being smoothed away by a single global interpolation.
+
+    Returns a dict {om_q, imd_q, edges} or None if too few wet pairs.
+    NOTE: quantile mapping corrects the *distribution*, not individual days —
+    it cannot know which specific day is heavy, only that a given fraction of
+    days should be. Judge it on distributional fidelity, not per-day MAE.
+    """
+    om_train = np.asarray(om_train, dtype=float)
+    imd_train = np.asarray(imd_train, dtype=float)
+    wet = (om_train >= RAIN_THRESHOLD) & (imd_train >= RAIN_THRESHOLD)
+    if wet.sum() < 50:
+        return None
+    edges = np.asarray(band_edges, dtype=float)
+    om_q = np.quantile(om_train[wet], edges)
+    imd_q = np.quantile(imd_train[wet], edges)
+    # enforce monotonic non-decreasing edges so interpolation is well-defined
+    om_q = np.maximum.accumulate(om_q)
+    imd_q = np.maximum.accumulate(imd_q)
+    return {"om_q": om_q, "imd_q": imd_q, "edges": edges}
+
+
+def apply_empirical_qm(qm, om):
+    """
+    Apply a piecewise quantile map to raw OM values.
+
+    Dry raw days (om < RAIN_THRESHOLD) are passed through unchanged — QM built on
+    wet pairs says nothing about them, and a dry forecast shouldn't be inflated.
+    Wet raw days are mapped OM-quantile -> IMD-quantile via the banded curve.
+    OM values beyond the training max are extrapolated by holding the top band's
+    OM:IMD ratio (so a record-breaking raw day isn't clipped to the training max).
+    """
+    om = np.asarray(om, dtype=float)
+    out = om.copy()
+    if qm is None:
+        return out
+    wet = om >= RAIN_THRESHOLD
+    if not wet.any():
+        return out
+    om_q, imd_q, edges = qm["om_q"], qm["imd_q"], qm["edges"]
+    # OM value -> its quantile position -> IMD value at that quantile
+    p = np.interp(om[wet], om_q, edges)
+    mapped = np.interp(p, edges, imd_q)
+    # extrapolate above the training max by the top-band multiplicative ratio
+    top_ratio = (imd_q[-1] / om_q[-1]) if om_q[-1] > 0 else 1.0
+    above_max = om[wet] > om_q[-1]
+    if above_max.any():
+        mapped[above_max] = om[wet][above_max] * top_ratio
+    out[wet] = mapped
+    return out
+
+
+def _pcp_metrics(pred, om, imd, ext_pctl=None):
+    """
+    MAE metrics for a precip prediction vs IMD truth. Returns all-day MAE plus,
+    if ext_pctl given and enough wet days exist, extreme-day MAE over days with
+    IMD >= that percentile (computed on wet days). Also returns a simple
+    distributional score: |P90(pred_wet) - P90(imd_wet)| so QM can be judged on
+    tail fidelity rather than only per-day MAE.
+    """
+    om = np.asarray(om, float); imd = np.asarray(imd, float); pred = np.asarray(pred, float)
+    raw_mae = float(np.abs(om - imd).mean())
+    corr_mae = float(np.abs(pred - imd).mean())
+    m = {"raw_mae": raw_mae, "corr_mae": corr_mae, "n": len(imd),
+         "raw_mae_ext": None, "corr_mae_ext": None, "ext_n": 0, "ext_thresh": None,
+         "p90_imd": None, "p90_raw": None, "p90_corr": None}
+    wet = imd >= RAIN_THRESHOLD
+    if wet.sum() >= 10:
+        wet_om = om >= RAIN_THRESHOLD
+        m["p90_imd"] = float(np.percentile(imd[wet], 90))
+        if wet_om.sum() >= 10:
+            m["p90_raw"] = float(np.percentile(om[wet_om], 90))
+            pw = pred[pred >= RAIN_THRESHOLD]
+            if len(pw) >= 10:
+                m["p90_corr"] = float(np.percentile(pw, 90))
+        if ext_pctl is not None:
+            thr = float(np.percentile(imd[wet], ext_pctl))
+            ext = imd >= thr
+            if ext.sum() > 0:
+                m["ext_thresh"] = thr; m["ext_n"] = int(ext.sum())
+                m["raw_mae_ext"] = float(np.abs(om[ext] - imd[ext]).mean())
+                m["corr_mae_ext"] = float(np.abs(pred[ext] - imd[ext]).mean())
+    return m
+
+
+def _fit_pcp(train):
+    """
+    Fit the precip correctors on a training frame. Returns a dict with the
+    classifier, ratio-regressor and empirical QM map, or None if insufficient
+    data. Shared by the CV folds and the final production model so the two are
+    guaranteed identical.
     """
     if train is None or len(train) < 100:
         return None
+    cls_feat = [f for f in RAIN_CLS_FEATURES if f in train.columns]
+    tc = train.copy()
+    tc["rain_obs"] = (tc["imd"] >= RAIN_THRESHOLD).astype(int)
+    y_cls = tc["rain_obs"].values
+    if y_cls.sum() < 20 or (1 - y_cls.mean()) < 0.01:
+        return None
+
+    cls_params = XGB_PARAMS.copy()
+    cls_params["n_estimators"] = 100
+    cls_params["max_depth"] = 4
+    spw = (1 - y_cls.mean()) / max(y_cls.mean(), 1e-6)
+    cls_model = xgb.XGBClassifier(**cls_params, scale_pos_weight=spw, n_jobs=1)
+    cls_model.fit(tc[cls_feat].values, y_cls)
+
+    rain_train = tc[(tc["rain_obs"] == 1) & (tc["om"] >= RAIN_THRESHOLD)].copy()
+    reg_feat = [f for f in RAIN_REG_FEATURES if f in rain_train.columns]
+    if len(rain_train) < 20:
+        return None
+    log_ratio = np.log(
+        rain_train["imd"].clip(lower=RAIN_THRESHOLD).values
+        / rain_train["om"].clip(lower=RAIN_THRESHOLD).values)
+    log_ratio = np.clip(log_ratio, PCP_LOG_RATIO_MIN, PCP_LOG_RATIO_MAX)
+    reg_model = xgb.XGBRegressor(**XGB_PARAMS, n_jobs=1)
+    reg_model.fit(rain_train[reg_feat].values, log_ratio)
+
+    # Empirical piecewise quantile map from all wet pairs in the training frame.
+    qm = build_empirical_qm(tc["om"].values, tc["imd"].values)
+
+    return {"cls_model": cls_model, "cls_features": cls_feat,
+            "reg_model": reg_model, "reg_features": reg_feat, "qm": qm}
+
+
+def _predict_pcp_ratio(fit, df):
+    """Anchored ratio-model prediction for a frame (uses cls + reg)."""
+    om = df["om"].values.astype(float)
+    cls_feat = [f for f in fit["cls_features"] if f in df.columns]
+    reg_feat = [f for f in fit["reg_features"] if f in df.columns]
+    cls_pred = fit["cls_model"].predict(df[cls_feat].values)
+    log_ratio = np.zeros_like(om)
+    above = om >= RAIN_THRESHOLD
+    if above.any():
+        log_ratio[above] = fit["reg_model"].predict(df[above][reg_feat].values)
+    return _apply_pcp_correction(om, cls_pred, log_ratio)
+
+
+def _tail_blend_weight(om):
+    """
+    QM weight as a function of raw mm: 0 below PCP_BLEND_LO_MM, ramping linearly
+    to PCP_BLEND_QM_WEIGHT at/above PCP_BLEND_HI_MM. Elementwise.
+    """
+    om = np.asarray(om, dtype=float)
+    span = max(PCP_BLEND_HI_MM - PCP_BLEND_LO_MM, 1e-6)
+    frac = np.clip((om - PCP_BLEND_LO_MM) / span, 0.0, 1.0)
+    return frac * PCP_BLEND_QM_WEIGHT
+
+
+def _blend_ratio_qm(ratio_pred, qm_pred, om):
+    """
+    Blend the ratio-model and QM predictions by raw mm. Ordinary days stay on the
+    ratio model (per-day skill); heavy raw days are pulled toward QM to restore
+    the tail magnitude the ratio model under-corrects. If QM is unavailable
+    (qm_pred is None) or the weight is zero, returns the ratio prediction.
+    """
+    if qm_pred is None or PCP_BLEND_QM_WEIGHT <= 0:
+        return ratio_pred
+    w = _tail_blend_weight(om)
+    return (1.0 - w) * ratio_pred + w * qm_pred
+
+
+def _predict_pcp_blend(fit, df):
+    """Tail-blended prediction: ratio model, pulled toward QM on heavy raw days."""
+    ratio_pred = _predict_pcp_ratio(fit, df)
+    qm_pred = apply_empirical_qm(fit.get("qm"), df["om"].values.astype(float))
+    return _blend_ratio_qm(ratio_pred, qm_pred, df["om"].values.astype(float))
+
+
+def _year_folds(years_available, n_folds):
+    """
+    Partition sorted unique years into up to n_folds contiguous blocks.
+    Returns a list of arrays of held-out years. Contiguous (not interleaved)
+    so each fold is a coherent time block.
+    """
+    yrs = np.array(sorted(set(int(y) for y in years_available)))
+    if len(yrs) < 2:
+        return []
+    k = int(min(n_folds, len(yrs)))
+    return [b for b in np.array_split(yrs, k) if len(b) > 0]
+
+
+def cv_evaluate_pcp(full, ext_pctl=PCP_EXTREME_PCTL, n_folds=CV_N_FOLDS):
+    """
+    Blocked-by-year CV for precipitation. For each year-block fold: fit on the
+    other years, evaluate on the held-out year for BOTH the ratio model and the
+    empirical QM. Test rows are OM-only (source==1) so skill reflects what we
+    actually correct at apply time. Pooled predictions across folds give the
+    reported MAE (all-day + extreme) and P90 distributional check per method.
+    """
+    if full is None or len(full) < 200 or "year" not in full.columns:
+        return None
+    folds = _year_folds(full["year"].values, n_folds)
+    if not folds:
+        return None
+
+    # accumulate pooled test-fold predictions
+    om_all, imd_all, ratio_all, qm_all, blend_all = [], [], [], [], []
+    for held in folds:
+        tr = full[~full["year"].isin(held)]
+        te = full[(full["year"].isin(held)) & (full.get("source", 1) == 1)]
+        te = te.dropna(subset=["imd"])
+        if len(te) == 0:
+            continue
+        fit = _fit_pcp(tr)
+        if fit is None:
+            continue
+        rp = _predict_pcp_ratio(fit, te)
+        qp = apply_empirical_qm(fit["qm"], te["om"].values)
+        om_all.append(te["om"].values.astype(float))
+        imd_all.append(te["imd"].values.astype(float))
+        ratio_all.append(rp)
+        qm_all.append(qp)
+        blend_all.append(_blend_ratio_qm(rp, qp, te["om"].values.astype(float)))
+
+    if not imd_all:
+        return None
+    om = np.concatenate(om_all); imd = np.concatenate(imd_all)
+    ratio_pred = np.concatenate(ratio_all); qm_pred = np.concatenate(qm_all)
+    blend_pred = np.concatenate(blend_all)
+    return {
+        "ratio": _pcp_metrics(ratio_pred, om, imd, ext_pctl),
+        "qm": _pcp_metrics(qm_pred, om, imd, ext_pctl),
+        "blend": _pcp_metrics(blend_pred, om, imd, ext_pctl),
+        "n_folds": len(imd_all),
+    }
+
+
+def train_grid_model(gd, var_key):
+    """
+    Fit the production model on a grid's FULL timeseries and attach blocked-by-
+    year CV skill. `gd` is the per-grid dict from build_grid_training, expected
+    to contain 'full'. Returns a model-data dict or None.
+    """
+    if gd is None:
+        return None
+    full = gd.get("full")
+    if full is None or len(full) < 100:
+        return None
 
     if var_key in ("tmax", "tmin"):
-        feat = [f for f in TEMP_FEATURES if f in train.columns]
+        feat = [f for f in TEMP_FEATURES if f in full.columns]
         model = xgb.XGBRegressor(**XGB_PARAMS, n_jobs=1)
-        model.fit(train[feat].values, train["imd"].values)
-        raw, corr, n = _eval_temp(model, feat, test)
+        model.fit(full[feat].values, full["imd"].values)
+        cvm = _cv_evaluate_temp(full, feat, var_key)
         return {"type": "regressor", "model": model, "features": feat,
-                "raw_mae": raw, "corr_mae": corr, "test_n": n}
+                "raw_mae": cvm["raw_mae"] if cvm else None,
+                "corr_mae": cvm["corr_mae"] if cvm else None,
+                "test_n": cvm["n"] if cvm else 0}
 
     elif var_key == "pcp":
-        cls_feat = [f for f in RAIN_CLS_FEATURES if f in train.columns]
-        tc = train.copy()
-        tc["rain_obs"] = (tc["imd"] >= RAIN_THRESHOLD).astype(int)
-        y_cls = tc["rain_obs"].values
-        if y_cls.sum() < 20 or (1 - y_cls.mean()) < 0.01:
+        fit = _fit_pcp(full)
+        if fit is None:
             return None
-
-        cls_params = XGB_PARAMS.copy()
-        cls_params["n_estimators"] = 100
-        cls_params["max_depth"] = 4
-        spw = (1 - y_cls.mean()) / max(y_cls.mean(), 1e-6)
-        cls_model = xgb.XGBClassifier(**cls_params, scale_pos_weight=spw, n_jobs=1)
-        cls_model.fit(tc[cls_feat].values, y_cls)
-
-        rain_train = tc[tc["rain_obs"] == 1]
-        reg_feat = [f for f in RAIN_REG_FEATURES if f in rain_train.columns]
-        if len(rain_train) < 20:
-            return None
-        reg_model = xgb.XGBRegressor(**XGB_PARAMS, n_jobs=1)
-        reg_model.fit(rain_train[reg_feat].values,
-                      np.log1p(rain_train["imd"].values))
-        raw, corr, n = _eval_pcp(cls_model, cls_feat, reg_model, reg_feat, test)
-        return {
-            "type": "two_stage",
-            "cls_model": cls_model, "cls_features": cls_feat,
-            "reg_model": reg_model, "reg_features": reg_feat,
-            "raw_mae": raw, "corr_mae": corr, "test_n": n,
-        }
+        cv = cv_evaluate_pcp(full)
+        md = {"type": "two_stage",
+              "cls_model": fit["cls_model"], "cls_features": fit["cls_features"],
+              "reg_model": fit["reg_model"], "reg_features": fit["reg_features"],
+              "qm": fit["qm"], "cv": cv}
+        return md
     return None
+
+
+def _cv_evaluate_temp(full, feat, var_key, n_folds=CV_N_FOLDS):
+    """Blocked-by-year CV for temperature (single regressor)."""
+    if full is None or "year" not in full.columns:
+        return None
+    folds = _year_folds(full["year"].values, n_folds)
+    if not folds:
+        return None
+    om_all, imd_all, pred_all = [], [], []
+    for held in folds:
+        tr = full[~full["year"].isin(held)]
+        te = full[(full["year"].isin(held)) & (full.get("source", 1) == 1)]
+        te = te.dropna(subset=["imd"])
+        if len(tr) < 100 or len(te) == 0:
+            continue
+        m = xgb.XGBRegressor(**XGB_PARAMS, n_jobs=1)
+        m.fit(tr[feat].values, tr["imd"].values)
+        om_all.append(te["om"].values.astype(float))
+        imd_all.append(te["imd"].values.astype(float))
+        pred_all.append(m.predict(te[feat].values))
+    if not imd_all:
+        return None
+    om = np.concatenate(om_all); imd = np.concatenate(imd_all); pred = np.concatenate(pred_all)
+    return {"raw_mae": float(np.abs(om - imd).mean()),
+            "corr_mae": float(np.abs(pred - imd).mean()), "n": len(imd)}
 
 
 def train_surrounding_models(era5_dir, forecast_path, imd_dir, elev_path,
@@ -423,9 +754,14 @@ def train_surrounding_models(era5_dir, forecast_path, imd_dir, elev_path,
     Returns list of (glat, glon, dist, model_data) for grids that trained OK.
     """
     grid_pairs = [(g[0], g[1]) for g in grid_pts]
+    # Per-variable override: ERA5 helps precip but hurts temperature here.
+    effective_source = PER_VAR_TRAIN_SOURCE.get(var_key) or train_source
+    if effective_source != train_source:
+        print(f"    [{var_key}] train_source override: "
+              f"{train_source} -> {effective_source}")
     grid_data = build_grid_training(
         era5_dir, forecast_path, imd_dir, elev_path, var_key, grid_pairs,
-        train_source=train_source)
+        train_source=effective_source)
 
     trained = []
     for glat, glon, dist in grid_pts:
@@ -433,7 +769,7 @@ def train_surrounding_models(era5_dir, forecast_path, imd_dir, elev_path,
         if gd is None:
             print(f"    skipped grid ({glat}, {glon}) — no data")
             continue
-        md = train_grid_model(gd["train"], gd["test"], var_key)
+        md = train_grid_model(gd, var_key)
         if md is not None:
             trained.append((glat, glon, dist, md))
     return trained
@@ -554,10 +890,12 @@ def add_var_features(df, var_col):
 # IDW PREDICTION FROM IN-MEMORY MODELS
 # ==============================================================================
 
-def predict_idw(df_var, var_key, trained_models):
+def predict_idw(df_var, var_key, trained_models, method="blend"):
     """
     trained_models : list of (glat, glon, dist, model_data)
     Applies each grid's model then inverse-distance-weights the results.
+    For pcp, `method` selects the corrector: 'ratio' (anchored ratio model,
+    the default production column) or 'qm' (empirical quantile mapping).
     """
     if not trained_models:
         return df_var["om"].values
@@ -569,16 +907,12 @@ def predict_idw(df_var, var_key, trained_models):
             feat = [f for f in md["features"] if f in df_var.columns]
             pred = md["model"].predict(df_var[feat].values)
         elif var_key == "pcp":
-            cls_feat = [f for f in md["cls_features"] if f in df_var.columns]
-            reg_feat = [f for f in md["reg_features"] if f in df_var.columns]
-            cls_pred = md["cls_model"].predict(df_var[cls_feat].values)
-            pred = np.copy(om)
-            above = om >= RAIN_THRESHOLD
-            pred[above & (cls_pred == 0)] = 0.0
-            correct = above & (cls_pred == 1)
-            if correct.sum() > 0:
-                lp = md["reg_model"].predict(df_var[correct][reg_feat].values)
-                pred[correct] = np.maximum(np.expm1(lp), RAIN_THRESHOLD)
+            if method == "qm":
+                pred = apply_empirical_qm(md.get("qm"), om.astype(float))
+            elif method == "ratio":
+                pred = _predict_pcp_ratio(md, df_var)
+            else:  # "blend" (default production corrector)
+                pred = _predict_pcp_blend(md, df_var)
         else:
             pred = om
         predictions.append(pred)
@@ -655,18 +989,75 @@ def process_location(
         corrected = predict_idw(df_var, var_key, trained)
         results[f"{var_key}_forecast_raw"] = df_var["om"].values
         results[f"{var_key}_forecast_corrected"] = corrected
+        if var_key == "pcp":
+            # corrected column above is the tail-blend (production). Also expose
+            # the pure ratio and pure QM columns for comparison/inspection.
+            results["pcp_forecast_ratio"] = predict_idw(
+                df_var, var_key, trained, method="ratio")
+            results["pcp_forecast_qm"] = predict_idw(
+                df_var, var_key, trained, method="qm")
 
-        # IDW-weighted 2025+ test skill across the surrounding grids
-        w, raw_acc, corr_acc = 0.0, 0.0, 0.0
-        for _, _, dist, md in trained:
-            if md.get("raw_mae") is not None and md.get("corr_mae") is not None:
+        # Blocked-by-year CV skill, IDW-weighted across the surrounding grids.
+        if var_key in ("tmax", "tmin"):
+            w, raw_acc, corr_acc = 0.0, 0.0, 0.0
+            for _, _, dist, md in trained:
+                if md.get("raw_mae") is not None and md.get("corr_mae") is not None:
+                    wi = 1.0 / max(dist, 0.001)
+                    raw_acc += wi * md["raw_mae"]; corr_acc += wi * md["corr_mae"]; w += wi
+            if w > 0:
+                raw_s, corr_s = raw_acc / w, corr_acc / w
+                imp = (raw_s - corr_s) / raw_s * 100 if raw_s else 0.0
+                print(f"    {var_key:4s} CV skill (blocked-year, IDW): "
+                      f"raw MAE={raw_s:.3f}  corr MAE={corr_s:.3f}  improvement={imp:+.1f}%")
+            else:
+                print(f"    {var_key:4s} CV skill: no test data")
+
+        elif var_key == "pcp":
+            # IDW-accumulate each method's all-day and extreme MAE + P90.
+            methods = ("ratio", "qm", "blend")
+            acc = {m: {"w": 0.0, "raw": 0.0, "corr": 0.0,
+                       "we": 0.0, "raw_e": 0.0, "corr_e": 0.0, "ext_n": 0,
+                       "wp": 0.0, "p90_imd": 0.0, "p90_raw": 0.0, "p90_corr": 0.0}
+                   for m in methods}
+            for _, _, dist, md in trained:
+                cv = md.get("cv")
+                if not cv:
+                    continue
                 wi = 1.0 / max(dist, 0.001)
-                raw_acc += wi * md["raw_mae"]
-                corr_acc += wi * md["corr_mae"]
-                w += wi
-        if w > 0:
-            raw_s, corr_s = raw_acc / w, corr_acc / w
-            imp = (raw_s - corr_s) / raw_s * 100 if raw_s else 0.0
+                for m in methods:
+                    e = cv.get(m)
+                    if not e or e.get("raw_mae") is None:
+                        continue
+                    a = acc[m]
+                    a["w"] += wi; a["raw"] += wi * e["raw_mae"]; a["corr"] += wi * e["corr_mae"]
+                    if e.get("corr_mae_ext") is not None:
+                        a["we"] += wi; a["raw_e"] += wi * e["raw_mae_ext"]
+                        a["corr_e"] += wi * e["corr_mae_ext"]; a["ext_n"] += e.get("ext_n", 0)
+                    if e.get("p90_corr") is not None:
+                        a["wp"] += wi; a["p90_imd"] += wi * e["p90_imd"]
+                        a["p90_raw"] += wi * e["p90_raw"]; a["p90_corr"] += wi * e["p90_corr"]
+
+            for m, label in (("ratio", "ratio-model"), ("qm", "empirical-QM"),
+                             ("blend", "tail-blend*")):
+                a = acc[m]
+                if a["w"] <= 0:
+                    print(f"    pcp  CV [{label:12s}]: no test data"); continue
+                raw_s, corr_s = a["raw"] / a["w"], a["corr"] / a["w"]
+                imp = (raw_s - corr_s) / raw_s * 100 if raw_s else 0.0
+                line = (f"    pcp  CV [{label:12s}]: all-day raw={raw_s:.2f} "
+                        f"corr={corr_s:.2f} ({imp:+.1f}%)")
+                if a["we"] > 0:
+                    raw_e, corr_e = a["raw_e"] / a["we"], a["corr_e"] / a["we"]
+                    imp_e = (raw_e - corr_e) / raw_e * 100 if raw_e else 0.0
+                    line += (f" | EXTREME(P{PCP_EXTREME_PCTL:.0f},n~{a['ext_n']}) "
+                             f"raw={raw_e:.1f} corr={corr_e:.1f} ({imp_e:+.1f}%)")
+                print(line)
+                if a["wp"] > 0:
+                    print(f"                        P90 wet-day mm: IMD={a['p90_imd']/a['wp']:.1f} "
+                          f"raw={a['p90_raw']/a['wp']:.1f} corrected={a['p90_corr']/a['wp']:.1f}"
+                          f"   (QM judged on this, not MAE)")
+            print("    * tail-blend = production corrected column "
+                  "(ratio model, pulled toward QM on heavy raw days)")
 
     # Keep the last OUTPUT_PAST_DAYS of history + all forecast rows;
     # drop only the oldest ROLL_BUFFER days used to warm up om_roll7.
@@ -688,7 +1079,8 @@ def process_location(
         "lat", "lon", "elevation", "date", "is_forecast",
         "tmax_forecast_raw", "tmax_forecast_corrected", "imd_tmax",
         "tmin_forecast_raw", "tmin_forecast_corrected", "imd_tmin",
-        "pcp_forecast_raw", "pcp_forecast_corrected", "imd_pcp",
+        "pcp_forecast_raw", "pcp_forecast_corrected",
+        "pcp_forecast_ratio", "pcp_forecast_qm", "imd_pcp",
     ]
     results = results[[c for c in col_order if c in results.columns]]
 
