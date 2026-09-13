@@ -41,4 +41,4 @@ jobs:
 
       - name: Sync data folder to Hugging Face Storage
         run: |
-          hf sync ./data hf://buckets/ShaanNeedsHugs/farmRisk-storage
+          hf sync ./data hf://buckets/vegadurmin/farmrisk-storage
