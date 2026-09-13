@@ -34,7 +34,7 @@ jobs:
           git commit -m "Deploy to Hugging Face Space"
           
           # Push to the existing Space repository using the HF token for authentication
-          git remote add hf https://ShaanNeedsHugs:${HF_TOKEN}@huggingface.co/spaces/ShaanNeedsHugs/farmRisk
+          git remote add hf https://vegadurmin:${HF_TOKEN}@huggingface.co/spaces/vegadurmin/farmrisk-models
           git push -f hf main
 
 
