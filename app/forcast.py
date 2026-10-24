@@ -852,8 +852,21 @@ def fetch_forecast(lat, lon, apikey, past_days=OUTPUT_PAST_DAYS + ROLL_BUFFER):
         return None
     live_df = live_df.drop_duplicates(subset=["date"], keep="last")
     live_df = live_df.sort_values("date").reset_index(drop=True)
-    live_df["is_forecast"] = (live_df["date"] >= pd.Timestamp(date.today())).astype(int)
+    live_df["is_forecast"] = (live_df["date"] >= _local_today(tz)).astype(int)
+
+    # The last forecast day can come back partially covered (model horizon ends
+    # mid-day), leaving NaN inputs that the bias-correction turns into garbage
+    # (e.g. a 42 °C Tmax with no rainfall). Drop forecast days with any NaN.
+    incomplete = (live_df["is_forecast"] == 1) & live_df[["tmax", "tmin", "pcp"]].isna().any(axis=1)
+    if incomplete.any():
+        live_df = live_df[~incomplete].reset_index(drop=True)
     return live_df
+
+
+def _local_today(tz):
+    """Today's date in the API's timezone. The server (HF Spaces) runs in UTC,
+    which is still "yesterday" in IST until 05:30, so date.today() is wrong."""
+    return pd.Timestamp.now(tz=tz).tz_localize(None).normalize()
 
 
 # ==============================================================================
@@ -1061,7 +1074,8 @@ def process_location(
 
     # Keep the last OUTPUT_PAST_DAYS of history + all forecast rows;
     # drop only the oldest ROLL_BUFFER days used to warm up om_roll7.
-    cutoff = pd.Timestamp(date.today()) - pd.Timedelta(days=OUTPUT_PAST_DAYS)
+    tz = "Asia/Kolkata" if (6.0 <= lat <= 38.0 and 68.0 <= lon <= 98.0) else "GMT"
+    cutoff = _local_today(tz) - pd.Timedelta(days=OUTPUT_PAST_DAYS)
     results = results[results["date"] >= cutoff].reset_index(drop=True)
 
     # Metadata
