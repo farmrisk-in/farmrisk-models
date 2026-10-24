@@ -1,8 +1,9 @@
 import os
 import sys
 import json
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response, HTMLResponse
+import hmac
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 
 # Add current workspace directory to sys.path if not present
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,6 +17,27 @@ app = FastAPI(
     description="API endpoints for Soil Moisture and Weather Forecast models.",
     version="1.0.0"
 )
+
+
+# Optional shared secret. When UPSTREAM_API_KEY is set on the Space, every
+# endpoint except the health/landing/docs pages requires the same value in the
+# X-Api-Key header (the FarmRisk Next.js app sends it). Unset, nothing changes.
+_UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY")
+_OPEN_PATHS = {"/", "/health", "/stats", "/docs", "/redoc", "/openapi.json"}
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if (
+        _UPSTREAM_API_KEY
+        and request.method != "OPTIONS"
+        and request.url.path not in _OPEN_PATHS
+        and not hmac.compare_digest(
+            request.headers.get("x-api-key", ""), _UPSTREAM_API_KEY
+        )
+    ):
+        return JSONResponse({"detail": "Invalid or missing API key"}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/", summary="API Portal Dashboard", response_class=HTMLResponse)
